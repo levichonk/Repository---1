@@ -1,0 +1,200 @@
+name: Digitalarkivet 24453 complete acquisition
+
+on:
+  push:
+    branches:
+      - tmp/digitalarkivet-24453-20260912
+    paths:
+      - '.da24453/**'
+      - '.github/workflows/digitalarkivet-24453.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  acquire-package-deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: digitalarkivet-24453-${{ github.run_id }}-${{ github.run_attempt }}
+      BASE_SHA: b7bda1cc405caf9b7059193ef2301eb0e9a5184b
+    steps:
+      - name: Checkout isolated temporary branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install declared Digitalarkivet runtime dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'httpx>=0.28,<1' 'Pillow>=12,<13' 'ReportLab>=4.4,<5' 'PyMuPDF>=1.26,<2'
+
+      - name: Preflight exact committed runner
+        run: |
+          set -euo pipefail
+          python -m py_compile .da24453/acquire.py
+          python - <<'PY'
+          import sys, httpx, PIL, reportlab, fitz
+          assert sys.version_info >= (3, 11)
+          print({
+              'python': sys.version.split()[0],
+              'httpx': httpx.__version__,
+              'Pillow': PIL.__version__,
+              'ReportLab': reportlab.Version,
+              'PyMuPDF': fitz.VersionBind,
+          })
+          PY
+
+      - name: Acquire all 577 scans and verify ZIP/PDF locally
+        run: |
+          set -euo pipefail
+          python .da24453/acquire.py 2>&1 | tee acquisition.log
+          test -f output/run-summary.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s=json.loads(Path('output/run-summary.json').read_text())
+          assert s['status']=='COMPLETE_LOCAL_VERIFIED', s
+          assert s['scan_count']==577, s
+          assert s['zip']['status']=='VERIFIED', s['zip']
+          assert s['zip']['image_count']==577, s['zip']
+          assert s['pdf']['status']=='VERIFIED', s['pdf']
+          assert s['pdf']['page_count']==577, s['pdf']
+          assert s['pdf']['raw_dct_streams_verified']==577, s['pdf']
+          assert s['pdf']['logical_page_labels_verified']==577, s['pdf']
+          print(json.dumps(s, indent=2))
+          PY
+
+      - name: Enforce release-asset size ceiling
+        run: |
+          set -euo pipefail
+          ZIP=$(find output -maxdepth 1 -type f -name '*_all_577_scans.zip' -print -quit)
+          PDF=$(find output -maxdepth 1 -type f -name '*_chronological_577_pages.pdf' -print -quit)
+          test -n "$ZIP" && test -n "$PDF"
+          for f in "$ZIP" "$PDF"; do
+            bytes=$(stat -c %s "$f")
+            echo "$f: $bytes bytes"
+            if [ "$bytes" -ge 2100000000 ]; then
+              echo "Asset exceeds conservative 2.1 GB release ceiling: $f" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create temporary PUBLIC delivery release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title 'Digitalarkivet 24453 — complete archival acquisition' \
+            --notes $'PUBLIC archival source delivery fallback for Digitalarkivet source 24453.\n\nScope: all 577 viewer scans.\nSkill-governed acquisition profile: digitalarkivet-archival-acquisition v0.1.2-phase5.\nThe archival ZIP is authoritative for acquired source bytes; the PDF is a chronological derivative.\nDelivery is not considered verified until post-upload fetch-back SHA-256 checks pass.'
+
+      - name: Upload payloads and verify released bytes by fetch-back
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ZIP=$(find output -maxdepth 1 -type f -name '*_all_577_scans.zip' -print -quit)
+          PDF=$(find output -maxdepth 1 -type f -name '*_chronological_577_pages.pdf' -print -quit)
+          FILES=(
+            "$ZIP"
+            "$PDF"
+            output/manifest.json
+            output/package-verification.json
+            output/pdf-verification.json
+            output/run-summary.json
+            output/acquisition-report.md
+            acquisition.log
+          )
+          : > delivery-evidence.tsv
+          mkdir -p "$RUNNER_TEMP/fetchback"
+          for f in "${FILES[@]}"; do
+            test -f "$f"
+            name=$(basename "$f")
+            local_bytes=$(stat -c %s "$f")
+            local_sha=$(sha256sum "$f" | awk '{print $1}')
+            echo "Uploading $name ($local_bytes bytes; $local_sha)"
+            gh release upload "$TAG" "$f#${name}" --clobber
+            url=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$name\") | .browser_download_url")
+            test -n "$url"
+            dest="$RUNNER_TEMP/fetchback/$name"
+            rm -f "$dest"
+            curl --fail --location --retry 6 --retry-delay 2 --retry-all-errors --output "$dest" "$url"
+            remote_bytes=$(stat -c %s "$dest")
+            remote_sha=$(sha256sum "$dest" | awk '{print $1}')
+            if [ "$remote_bytes" != "$local_bytes" ] || [ "$remote_sha" != "$local_sha" ]; then
+              echo "Fetch-back verification FAILED for $name" >&2
+              exit 1
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$local_bytes" "$local_sha" "$remote_bytes" "$remote_sha" "$url" >> delivery-evidence.tsv
+            rm -f "$dest"
+          done
+
+          python - <<'PY'
+          import csv, json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          records=[]
+          with Path('delivery-evidence.tsv').open(newline='', encoding='utf-8') as f:
+              for row in csv.reader(f, delimiter='\t'):
+                  name, lb, ls, rb, rs, url = row
+                  records.append({
+                      'name': name,
+                      'local_bytes': int(lb),
+                      'local_sha256': ls,
+                      'fetchback_bytes': int(rb),
+                      'fetchback_sha256': rs,
+                      'browser_download_url': url,
+                      'verification_level': 'STRONG',
+                  })
+          receipt={
+              'schema_version': '1.0',
+              'status': 'DELIVERED_VERIFIED',
+              'verification_strength': 'STRONG',
+              'backend': 'github-release',
+              'access_classification': 'PUBLIC',
+              'source_id': '24453',
+              'scope': {'kind':'all','scan_count':577},
+              'release_tag': __import__('os').environ['TAG'],
+              'created_at_utc': datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),
+              'records': records,
+          }
+          Path('output/delivery-receipt.json').write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding='utf-8')
+          PY
+
+          # Upload the delivery receipt last, then verify that final asset too.
+          gh release upload "$TAG" output/delivery-receipt.json#delivery-receipt.json --clobber
+          receipt_url=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | select(.name == "delivery-receipt.json") | .browser_download_url')
+          curl --fail --location --retry 6 --retry-delay 2 --retry-all-errors --output "$RUNNER_TEMP/fetchback/delivery-receipt.json" "$receipt_url"
+          test "$(sha256sum output/delivery-receipt.json | awk '{print $1}')" = "$(sha256sum "$RUNNER_TEMP/fetchback/delivery-receipt.json" | awk '{print $1}')"
+          test "$(stat -c %s output/delivery-receipt.json)" = "$(stat -c %s "$RUNNER_TEMP/fetchback/delivery-receipt.json")"
+          echo "DELIVERY_VERIFIED_STRONG"
+
+      - name: Print terminal delivery state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Release tag: $TAG"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '{html_url, tag_name, prerelease, assets: [.assets[] | {name,size,digest,browser_download_url}]}'
+          cat output/delivery-receipt.json
+
+      - name: Restore temporary branch tip after successful delivery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/tmp/digitalarkivet-24453-20260912" \
+            -f sha="$BASE_SHA" \
+            -F force=true
+          echo "Temporary branch restored to $BASE_SHA; main was never modified."
