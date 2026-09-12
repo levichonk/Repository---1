@@ -39,7 +39,7 @@ jobs:
       - name: Preflight exact committed runner
         run: |
           set -euo pipefail
-          python -m py_compile .da24453/acquire.py
+          python -m py_compile .da24453/acquire.py .da24453/run.py
           python - <<'PY'
           import sys, httpx, PIL, reportlab, fitz
           assert sys.version_info >= (3, 11)
@@ -55,7 +55,7 @@ jobs:
       - name: Acquire all 577 scans and verify ZIP/PDF locally
         run: |
           set -euo pipefail
-          python .da24453/acquire.py 2>&1 | tee acquisition.log
+          python .da24453/run.py 2>&1 | tee acquisition.log
           test -f output/run-summary.json
           python - <<'PY'
           import json
@@ -171,7 +171,6 @@ jobs:
           Path('output/delivery-receipt.json').write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding='utf-8')
           PY
 
-          # Upload the delivery receipt last, then verify that final asset too.
           gh release upload "$TAG" output/delivery-receipt.json#delivery-receipt.json --clobber
           receipt_url=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | select(.name == "delivery-receipt.json") | .browser_download_url')
           curl --fail --location --retry 6 --retry-delay 2 --retry-all-errors --output "$RUNNER_TEMP/fetchback/delivery-receipt.json" "$receipt_url"
